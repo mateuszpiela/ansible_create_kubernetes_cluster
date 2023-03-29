@@ -1,0 +1,236 @@
+- name: Remove other containers
+  hosts: all
+  remote_user: root
+
+  tasks:
+    - name: Remove podman
+      ansible.builtin.yum:
+        name: podman
+        state: absent
+    - name: Remove containerd
+      ansible.builtin.yum:
+        name: containerd
+        state: absent
+    - name: Remove dockerd
+      ansible.builtin.yum:
+        name: docker
+        state: absent
+
+- name: Configure system
+  hosts: all
+  remote_user: root
+
+  tasks:
+    - name: SELinux disable
+      changed_when: true
+      ansible.builtin.command:
+        cmd: setenforce 0
+    - name: SELinux set to permissive
+      ansible.posix.selinux:
+        policy: targeted
+        state: permissive
+    - name: Add required modules to load on start
+      ansible.builtin.lineinfile:
+        path: /etc/modules-load.d/k8s.conf
+        create: true
+        mode: '0600'
+        state: present
+        line: "overlay\nbr_netfilter"
+    - name: Load overlay kernel module
+      changed_when: true
+      ansible.builtin.command:
+        cmd: modprobe overlay
+    - name: Load br_netfilter kernel module
+      changed_when: true
+      ansible.builtin.command:
+        cmd: modprobe br_netfilter
+    - name: Disable SWAP
+      changed_when: true
+      ansible.builtin.command:
+        cmd: swapoff -a
+    - name: Kernel parameters setup
+      ansible.builtin.lineinfile:
+        path: /etc/sysctl.d/k8s.conf
+        mode: '0600'
+        create: true
+        state: present
+        line: "net.bridge.bridge-nf-call-iptables  = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward                 = 1"
+    - name: Load new kernel parameters
+      changed_when: true
+      ansible.builtin.command:
+        cmd: sysctl --system
+    - name: Disable FirewallD
+      ansible.builtin.systemd_service:
+        name: firewalld
+        state: stopped
+        enabled: false
+    - name: Install conntrack
+      ansible.builtin.yum:
+        name: "conntrack-tools"
+        state: installed
+    - name: Install iproute-tc
+      ansible.builtin.yum:
+        name: "iproute-tc"
+        state: installed
+
+- name: Install Container Runtime Interface - O (CRI-O)
+  hosts: all
+  remote_user: root
+
+  vars:
+    version: "1.24"
+
+  tasks:
+    - name: Add libcontainers repo
+      ansible.builtin.yum_repository:
+        name: libcontainers
+        description: libcontainers
+        baseurl: https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ os }}/
+        gpgkey: https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/{{ os }}/repodata/repomd.xml.key
+
+    - name: Add cri-o repo
+      ansible.builtin.yum_repository:
+        name: cri-o
+        description: cri-o
+        baseurl: https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/{{ version }}/{{ os }}/
+        gpgkey: https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable:/cri-o:/{{ version }}/{{ os }}/repodata/repomd.xml.key
+
+    - name: Install cri-o
+      ansible.builtin.yum:
+        name: cri-o
+        state: present
+
+- name: Configure CRI-O
+  hosts: all
+  remote_user: root
+
+  tasks:
+    - name: Configure conmon_cgroup in cri-O
+      ansible.builtin.replace:
+        path: /etc/crio/crio.conf
+        regexp: '^# conmon_cgroup = ""'
+        replace: 'conmon_cgroup = "pod"'
+    - name: Configure cgroup_manager in cri-O
+      ansible.builtin.replace:
+        path: /etc/crio/crio.conf
+        regexp: '^# cgroup_manager = "systemd"'
+        replace: 'cgroup_manager = "systemd"'
+    - name: Configure image pause
+      ansible.builtin.replace:
+        path: /etc/crio/crio.conf
+        regexp: '^# pause_image = "registry.k8s.io/pause:3.6"'
+        replace: 'pause_image = "registry.k8s.io/pause:3.6"'
+
+- name: Start CRI-O
+  hosts: all
+  remote_user: root
+
+  tasks:
+    - name: Reload daemons
+      ansible.builtin.systemd:
+        daemon_reload: true
+    - name: Enable & start CRI-O
+      ansible.builtin.systemd_service:
+        name: crio
+        state: started
+        enabled: true
+
+- name: Install CNI & CRICTL
+  hosts: all
+  remote_user: root
+
+  vars:
+    cni_plugin_ver: "v1.1.1"
+    crictl_ver: "v1.25.0"
+    dest: "/opt/cni/bin"
+    dest_bin: "/usr/local/bin"
+
+  tasks:
+    - name: Download & Unpack CNI
+      ansible.builtin.unarchive:
+        remote_src: true
+        src: "https://github.com/containernetworking/plugins/releases/download/{{ cni_plugin_ver }}/cni-plugins-linux-{{ arch }}-{{ cni_plugin_ver }}.tgz"
+        dest: "{{ dest }}"
+    - name: Download & Unpack CRICTL
+      ansible.builtin.unarchive:
+        remote_src: true
+        src: "https://github.com/kubernetes-sigs/cri-tools/releases/download/{{ crictl_ver }}/crictl-{{ crictl_ver }}-linux-{{ arch }}.tar.gz"
+        dest: "{{ dest_bin }}"
+
+- name: Install kubernetes toolset
+  hosts: all
+  remote_user: root
+
+  vars:
+    arch: amd64
+
+  tasks:
+    - name: Get latest version from dl.k8s.io
+      ansible.builtin.uri:
+        url: https://dl.k8s.io/release/stable.txt
+        follow_redirects: "all"
+        return_content: true
+      register: kube_stable_ver
+    - name: Download kubeadm
+      ansible.builtin.get_url:
+        url: https://dl.k8s.io/release/{{ kube_stable_ver['content'] }}/bin/linux/{{ arch }}/kubeadm
+        dest: /usr/local/bin/kubeadm
+        mode: '0755'
+    - name: Download kubelet
+      ansible.builtin.get_url:
+        url: https://dl.k8s.io/release/{{ kube_stable_ver['content'] }}/bin/linux/{{ arch }}/kubelet
+        dest: /usr/local/bin/kubelet
+        mode: '0755'
+
+- name: Install kubelet systemd service
+  hosts: all
+  remote_user: root
+
+  vars:
+    rel_ver: "v0.4.0"
+
+  tasks:
+    - name: Download kubelet.service
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/kubernetes/release/{{ rel_ver }}/cmd/kubepkg/templates/latest/deb/kubelet/lib/systemd/system/kubelet.service
+        mode: '0644'
+        dest: /etc/systemd/system/kubelet.service
+    - name: Configure kubelet.service
+      ansible.builtin.replace:
+        path: /etc/systemd/system/kubelet.service
+        regexp: '^ExecStart=/usr/bin'
+        replace: 'ExecStart=/usr/local/bin'
+    - name: Create override directory kubelet.service.d
+      ansible.builtin.file:
+        path: /etc/systemd/system/kubelet.service.d
+        mode: '0644'
+        state: directory
+    - name: Download 10-kubeadm.conf
+      ansible.builtin.get_url:
+        url: https://raw.githubusercontent.com/kubernetes/release/{{ rel_ver }}/cmd/kubepkg/templates/latest/deb/kubeadm/10-kubeadm.conf
+        mode: '0644'
+        dest: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+    - name: Configure 10-kubeadm.conf
+      ansible.builtin.replace:
+        path: /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+        regexp: '^ExecStart=/usr/bin'
+        replace: 'ExecStart=/usr/local/bin'
+    - name: Reload daemons
+      ansible.builtin.systemd:
+        daemon_reload: true
+    - name: Start kubelet
+      ansible.builtin.systemd_service:
+        name: "kubelet"
+        state: started
+        enabled: true
+    - name: Containers policy keyPaths Fix
+      ansible.builtin.replace:
+        path: /etc/containers/policy.json
+        regexp: '^.*keyPaths.*'
+        replace: '                    "keyPath": "/etc/pki/rpm-gpg/RPM-GPG-KEY-redhat-release"'
+    - name: Show info
+      ansible.builtin.debug:
+        msg:
+          - "Instalacja pakietow oraz konfiguracja zaleznych klastra zakonczona!"
+          - "Uruchom teraz initialize-cluster-play.yaml"
+          - "a na koncu uruchom install-kubernetes-kubectl-play.yaml!"

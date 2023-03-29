@@ -1,0 +1,16 @@
+- name: Install kubectl
+  hosts: controlplane
+  remote_user: root
+
+  tasks:
+    - name: Get latest version from dl.k8s.io
+      ansible.builtin.uri:
+        url: https://dl.k8s.io/release/stable.txt
+        follow_redirects: "all"
+        return_content: true
+      register: kube_stable_ver
+    - name: Download kubectl
+      ansible.builtin.get_url:
+        url: https://dl.k8s.io/release/{{ kube_stable_ver['content'] }}/bin/linux/{{ arch }}/kubectl
+        dest: /usr/local/bin/kubectl
+        mode: '0755'

@@ -1,0 +1,20 @@
+- name: Get join command
+  hosts: controlplane
+  remote_user: root
+
+  tasks:
+    - name: Generate join command
+      changed_when: true
+      ansible.builtin.command:
+        cmd: kubeadm token create --print-join-command
+      register: join_cmd
+
+- name: Join workers to cluster
+  hosts: workers
+  remote_user: root
+
+  tasks:
+    - name: Join workers to cluster
+      changed_when: true
+      ansible.builtin.command:
+        cmd: "{{ hostvars[groups['controlplane'][0]]['join_cmd']['stdout'] }}"

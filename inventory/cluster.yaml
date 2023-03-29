@@ -1,0 +1,16 @@
+all:
+  hosts:
+    controlplane.kube:
+    worker1.kube:
+    worker2.kube:
+  vars:
+    arch: amd64
+    os: CentOS_8_Stream
+  children:
+    controlplane:
+      hosts:
+        controlplane.kube:
+    workers:
+      hosts:
+        worker1.kube:
+        worker2.kube:
